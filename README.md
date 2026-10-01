@@ -295,6 +295,3 @@ This repo is best treated as a prototype for building a practical, reviewable AI
 - [ ] Kubernetes integration tests against a local kind cluster
 - [ ] Multi-agent parallelism - separate agents per service
 
-## License
-
-MIT
