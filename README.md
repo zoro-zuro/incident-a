@@ -1,345 +1,280 @@
-## Incident-response-on-call-agent
+# Incident Response On-Call Agent
 
+An event-driven incident response system that listens for alerts, searches historical incidents and runbooks, evaluates likely root causes, and coordinates a human-approved remediation path. The project combines a Python LangGraph workflow, a FastAPI backend, a Redis event bus, and a small React dashboard for incident tracking.
 
-> ## On-call alert fatigue is one of the biggest pain points in production engineering. This project explores how far an autonomous agent can get in incident response before needing a human in the loop.
->
-> Stack: LangGraph · Ollama · ChromaDB · Redis · FastAPI
+## What the project does
 
----
+The app is designed for the first phase of incident handling, where the agent:
 
-## What This Project Does
+- ingests an alert from Redis or an HTTP request
+- classifies the severity and affected services
+- recalls similar incidents from ChromaDB memory
+- gathers logs, metrics, service health, and deployment metadata
+- retrieves the most relevant runbook via semantic search
+- asks a configured decision provider for a recommended action
+- waits for human approval before performing a remediation
+- stores the resulting incident state and report for future recall
 
-Modern distributed systems generate thousands of alerts daily. When something breaks at 3am, an engineer gets woken up and spends 45 minutes:
-- Digging through logs manually
-- Checking dashboards
-- Finding the right runbook
-- Figuring out what to do
-- Paging the right team
-- Writing up the incident
-
-**This agent handles that first response automatically investigating the logs, finding the root cause, attempting a fix, and paging the right team.**
-
----
-## Demo
-
-
-
-🚀 **Live API:** [https://incident-response-on-call-agent-production.up.railway.app/docs]
-
-```bash
-# Start everything
-./start.sh
-
-# Fire a P1 incident
-curl -X POST http://localhost:8000/incidents/test/P1
-
-# Watch the agent work in Terminal 1:
-# 🚨 [ingest_alert]       Severity: P1 | Services: checkout-service
-# 🧠 [recall_memory]      Found INC-2831 (89% match) - same issue 2 weeks ago
-# 🔍 [fetch_evidence]     12 logs, 7 metrics fetched
-# 🧠 [analyze_root_cause] Confidence: 94% - DB pool exhaustion
-# ✅  Confidence >= 92% - proceeding
-# 📖 [fetch_runbook]      Matched: DB Connection Pool Exhaustion (91%)
-# 🤖 [auto_remediate]     Rolling back checkout-service deployment
-# ✅  Rollback successful
-# 📟 [page_oncall]        Paged: payments-oncall
-# 💬 [notify_slack]       Posted to #incidents
-# 🎫 [create_ticket]      Created: INC-3847
-# 📋 [generate_report]    Postmortem written
-# 💾 [save_to_memory]     Stored for future recall
-```
-
-**Open Swagger UI:** http://localhost:8000/docs
-
----
+This is not a full production SRE platform; it is a practical local prototype for evaluating agent-driven incident triage and response.
 
 ## Architecture
 
-![Architecture](architecture.png)
-
-```
-Alert Sources (PagerDuty / Datadog / API / CLI)
-                    ↓
-           Redis pub/sub queue
-                    ↓
-    ┌───────────────────────────────┐
-    │        LangGraph Agent        │
-    │                               │
-    │  1. ingest_alert              │
-    │     classify P0/P1/P2/P3      │
-    │                               │
-    │  2. recall_memory             │◄──── ChromaDB (past incidents)
-    │     find similar past events  │
-    │                               │
-    │  3. fetch_evidence            │
-    │     logs + Prometheus metrics │
-    │                               │
-    │  4. analyze_root_cause        │◄──── Ollama (mistral - local LLM)
-    │     confidence loop:          │
-    │     while confidence < 0.92:  │
-    │       re-fetch wider window   │
-    │       re-reason               │
-    │                               │
-    │  5. fetch_runbook             │◄──── ChromaDB (runbook RAG)
-    │     semantic search           │
-    │                               │
-    │  6. auto_remediate            │
-    │     if confidence >= 0.92:    │
-    │       kubectl restart/rollback│
-    │       scale pods / clear cache│
-    │                               │
-    │  7. page_oncall    (PagerDuty)│
-    │  8. notify_slack   (#incidents│
-    │  9. create_ticket  (Jira)     │
-    │  10. generate_report          │
-    │  11. save_to_memory           │◄──── ChromaDB (stores for future)
-    └───────────────────────────────┘
-                    ↓
-    FastAPI REST API  ·  LangSmith Traces
+```text
+Alert source / REST API / CLI
+        |
+        v
+Redis pub/sub channel: alerts
+        |
+        v
+agent.listener
+        |
+        v
+LangGraph workflow in agent.graph
+        |-- recall_memory -> ChromaDB historical incidents
+        |-- fetch_evidence -> simulated logs/metrics/service data
+        |-- fetch_runbook -> ChromaDB runbook RAG
+        |-- make_decision -> Groq, mock, or Laya provider
+        |-- human approval -> approval workflow
+        |-- auto_remediate -> simulated remediation
+        |-- generate_report -> stored incident state
+        |
+        v
+FastAPI API + incident state cache + Redis persistence
+        |
+        v
+React frontend dashboard
 ```
 
----
+The system is intentionally modular: the decision provider, remediation behavior, queue, and storage are isolated behind simple interfaces.
 
-## Key Features
+## Core technologies
 
-### 1. Event-Driven Architecture
-Alerts arrive via Redis pub/sub - the agent subscribes and fires automatically. No polling, no manual triggers in production.
+- Python 3.11+
+- LangGraph for orchestration
+- FastAPI for the API layer
+- Redis for event-driven alert delivery
+- ChromaDB + sentence-transformers for memory and runbook retrieval
+- Groq cloud LLM support, plus a deterministic mock provider for local demos
+- React + Vite for the frontend dashboard
+- Docker for Redis and optional containerized deployment
 
-### 2. Confidence-Based Reasoning Loop
-```python
-while confidence < 0.92:
-    logs = query_logs(window=wider_each_retry)
-    metrics = query_prometheus()
-    hypothesis = ollama_reason(logs, metrics, past_incidents)
-    confidence = hypothesis["confidence"]
+## Decision providers
 
-if confidence >= 0.92:
-    auto_remediate()
-else:
-    escalate_to_human()
-```
-The agent never acts when it's uncertain. It keeps gathering evidence until confident or escalates.
+The app supports multiple provider modes through the environment variable `DECISION_PROVIDER`:
 
-### 3. RAG Runbook Retrieval
-All runbooks are stored as markdown files, embedded into ChromaDB using `sentence-transformers`. When an incident happens, the agent does semantic search - not keyword matching - to find the most relevant playbook.
+- `mock`: deterministic local demo logic for offline testing
+- `groq`: structured decision-making with a Groq API key
+- `laya`: optional typed-decision model via the Laya package
 
-### 4. Incident Memory
-Every resolved incident is stored in a separate ChromaDB collection. When a new incident arrives, the agent recalls similar past events and injects them into its reasoning prompt - getting faster and more accurate over time.
+The default environment file includes `mock` and `groq` examples, while the rest of the graph depends on a consistent decision interface rather than a single model.
 
-### 5. Auto-Remediation
-```python
-if confidence >= 0.92 and rule_matched:
-    restart_service()      # kubectl rollout restart
-    rollback_deployment()  # kubectl rollout undo
-    scale_pods(replicas=6) # kubectl scale
-    clear_cache()          # redis-cli FLUSHDB
-```
-Real `kubectl` calls - not simulated. In mock mode they return realistic responses.
+## Runbook and memory workflow
 
-### 6. Runs Fully Local
-Uses Ollama to run Mistral locally - no OpenAI API key, no data leaving your network, zero cost at scale. Critical for enterprise use cases where logs and incidents contain sensitive data.
+The repository includes markdown runbooks under `runbooks/` and a memory store in ChromaDB. The workflow behaves like this:
 
----
+1. A service alert arrives.
+2. The agent searches historical incidents for similar failures.
+3. It collects evidence and retrieves the most relevant runbook.
+4. It asks the decision provider whether the issue is likely a deployment regression, infra fault, or another cause.
+5. It recommends an action and waits for approval before changing the system state.
 
-## Tech Stack
+## Project structure
 
-| Layer | Technology |
-|---|---|
-| Agent orchestration | LangGraph (StateGraph) |
-| Local LLM | Ollama - Mistral / Llama 3.1 / DeepSeek |
-| Vector DB | ChromaDB + sentence-transformers |
-| Queue | Redis pub/sub |
-| API | FastAPI + Uvicorn |
-| Observability | LangSmith |
-| Infra | Docker Compose |
-| Remediation | kubectl + Docker SDK |
-
----
-
-## Project Structure
-
-```
-incident-response-agent-v2/
+```text
+Incident-response-on-call-agent/
 ├── agent/
-│   ├── state.py          # TypedDict - shared agent brain
-│   ├── graph.py          # LangGraph - 10 nodes + confidence loop
-│   ├── tools.py          # External integrations (logs, PD, Slack, Jira)
-│   ├── llm.py            # Ollama setup + MockLLM
-│   ├── reasoner.py       # Confidence scoring + prompt engineering
-│   ├── metrics.py        # Prometheus / Grafana queries
-│   ├── remediation.py    # kubectl restart / rollback / scale / cache
-│   ├── rag.py            # ChromaDB runbook ingestion + retrieval
-│   ├── memory.py         # ChromaDB incident memory store
-│   ├── redis_queue.py    # Redis pub/sub listener (auto-reconnect)
-│   └── listener.py       # Main entrypoint
+│   ├── approval.py              # human approval flow
+│   ├── decision_provider.py     # mock / groq / laya provider abstraction
+│   ├── embeddings.py            # embedding helpers
+│   ├── graph.py                 # LangGraph workflow and stages
+│   ├── incident_runner.py       # execution + state tracking + Redis sync
+│   ├── listener.py              # Redis subscription entrypoint
+│   ├── llm.py                   # LLM integration
+│   ├── memory.py                # ChromaDB incident memory logic
+│   ├── metrics.py               # metrics/query helpers
+│   ├── rag.py                   # runbook ingestion and retrieval
+│   ├── reasoner.py              # confidence and retry logic
+│   ├── redis_queue.py           # Redis pub/sub helpers
+│   ├── remediation.py           # remediation planning and execution
+│   ├── simulated_env.py         # simulated infra evidence
+│   ├── state.py                 # typed workflow state
+│   └── tools.py                 # external integrations and helper calls
 ├── api/
-│   └── main.py           # FastAPI REST API
-├── runbooks/             # Markdown runbooks (embedded into ChromaDB)
-│   ├── db_connection_pool.md
-│   ├── redis_connection_failure.md
-│   ├── elasticsearch_rebalancing.md
-│   ├── high_error_rate.md
-│   └── memory_leak.md
+│   └── main.py                  # FastAPI API and endpoints
+├── frontend/
+│   ├── package.json             # React/Vite app setup
+│   ├── src/
+│   └── public/
 ├── infra/
 │   ├── docker-compose.yml
-│   └── Dockerfile
+│   ├── Dockerfile
+│   └── redis.conf
+├── runbooks/
+│   ├── db_connection_pool.md
+│   ├── elasticsearch_rebalancing.md
+│   ├── high_error_rate.md
+│   ├── memory_leak.md
+│   └── redis_connection_failure.md
 ├── scripts/
-│   └── publish_alert.py  # Test: push alert to Redis
+│   └── publish_alert.py         # publish sample alerts to Redis
+├── tests/
+│   └── test_decision_provider.py
 ├── .env.example
+├── .gitignore
+├── GETTING_STARTED.md
+├── Procfile
+├── README.md
 ├── requirements.txt
-├── start.sh
-└── README.md
+├── requirements-laya.txt
+├── architecture.png
+└── JULES_REPORT.md
 ```
 
----
+## Quick start
 
-## Setup & Run
+### 1. Create the environment
 
-### Prerequisites
-- Python 3.11+
-- Redis (`brew install redis`)
-- Ollama (`brew install ollama`) - optional, USE_MOCK_LLM=1 skips it
+On Windows PowerShell:
 
-### Quick Start
+```powershell
+cd D:\Incident-response-on-call-agent
+py -3.13 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install -r requirements.txt
+Copy-Item .env.example .env
+```
 
-```bash
-# 1. Clone and install
-git clone https://github.com/chayachandana/incident-response-agent-v2
-cd incident-response-agent-v2
-pip install -r requirements.txt
+The sample environment file includes the core variables for Redis, Groq, and approval mode. For a quick local demo, the simplest configuration is:
 
-# 2. Configure
-cp .env.example .env
-# Edit .env - set USE_MOCK_LLM=1 for demo without Ollama
+```env
+REDIS_URL=redis://localhost:6379
+USE_MOCK_LLM=1
+DECISION_PROVIDER=mock
+APPROVAL_MODE=manual
+LANGCHAIN_TRACING_V2=false
+```
 
-# 3. Ingest runbooks into ChromaDB
+For Groq-backed reasoning instead:
+
+```env
+REDIS_URL=redis://localhost:6379
+USE_MOCK_LLM=1
+DECISION_PROVIDER=groq
+GROQ_API_KEY=your_groq_api_key_here
+GROQ_MODEL=llama-3.3-70b-versatile
+GROQ_TIMEOUT_SECONDS=20
+APPROVAL_MODE=manual
+LANGCHAIN_TRACING_V2=false
+```
+
+### 2. Start Redis
+
+Using Docker:
+
+```powershell
+docker run --name incident-redis -p 6379:6379 -d redis:7-alpine
+```
+
+Verify it is up:
+
+```powershell
+docker exec incident-redis redis-cli ping
+```
+
+Expected output:
+
+```text
+PONG
+```
+
+### 3. Initialize local memory and runbooks
+
+```powershell
 python -m agent.rag
-
-# 4. Seed incident memory
 python -m agent.memory
+```
 
-# 5. Start Redis
-brew services start redis
+These commands build the local ChromaDB collections used for semantic retrieval and incident recall.
 
-# 6. Start everything - needs 3 terminals
+### 4. Start the API
 
-# Terminal 1 - API server
+```powershell
 uvicorn api.main:app --reload --port 8000
+```
 
-# Terminal 2 - Agent listener (waits for alerts)
+Then open:
+
+```text
+http://localhost:8000/docs
+```
+
+### 5. Start the worker
+
+In a second terminal:
+
+```powershell
 python -m agent.listener
+```
 
-# Terminal 3 - Fire a test alert (after Terminal 2 shows "Waiting for alerts...")
+The listener subscribes to the `alerts` Redis channel and executes the incident workflow when messages arrive.
+
+### 6. Trigger a sample incident
+
+In a third terminal:
+
+```powershell
 python scripts/publish_alert.py --sev P1
-
-# Or fire via curl instead of Terminal 3:
-curl -X POST http://localhost:8000/incidents/test/P1
 ```
 
-### Or one command
-```bash
-chmod +x start.sh
-./start.sh
+You can also trigger a test incident through the API:
+
+```powershell
+Invoke-RestMethod -Method Post -Uri http://localhost:8000/incidents/test/P1
 ```
 
-### Or Docker
-```bash
-cd infra
-docker compose up --build
+## API overview
+
+The backend exposes the following major endpoints:
+
+- `GET /health` — health check for Redis, memory, Groq, and agent status
+- `GET /stats` — system statistics
+- `POST /incidents` — create an incident from an alert payload
+- `GET /incidents` — list incidents
+- `GET /incidents/{id}` — fetch incident details and timeline
+- `POST /incidents/{id}/approve` — approve the recommended action
+- `POST /incidents/{id}/reject` — reject the recommendation
+- `GET /incidents/{id}/report` — fetch the generated incident report
+- `GET /runbooks` and `GET /runbooks/{name}` — list and inspect runbooks
+- `GET /memory` — query history in the memory store
+
+The app also supports `/api/...` aliases for the same API surfaces.
+
+## Frontend
+
+The frontend lives in `frontend/` and uses React + Vite. It provides a lightweight dashboard for incident overview, details, runbooks, and memory views. To run it locally:
+
+```powershell
+cd frontend
+npm install
+npm run dev
 ```
 
----
+## Notes and current status
 
-## API Endpoints
+- The project is designed around local-first investigation and a controlled approval loop.
+- `APPROVAL_MODE=manual` is the default safe mode; the agent will not blindly execute a remediation without operator approval.
+- Some integrations such as PagerDuty, Slack, Jira, and real observability backends are represented as optional or simulated layers rather than fully connected production integrations.
+- For a more hands-on Windows setup guide, see [GETTING_STARTED.md](GETTING_STARTED.md).
 
-| Method | Endpoint | Description |
-|---|---|---|
-| `GET` | `/health` | Redis + memory healthcheck |
-| `GET` | `/stats` | Agent performance stats |
-| `POST` | `/incidents` | Trigger agent with alert payload |
-| `GET` | `/incidents` | List all incidents |
-| `GET` | `/incidents/{id}` | Get specific incident result |
-| `POST` | `/incidents/test/P1` | Fire sample P1 alert (demo) |
+## Recommended next steps
 
-**Swagger UI:** http://localhost:8000/docs
+- add real log/metrics adapters for your environment
+- connect PagerDuty, Slack, and Jira webhooks
+- replace the simulated remediation logic with actual infrastructure actions
+- wire the frontend to the live incident state and SSE/refresh workflow
+- expand the runbook library and historical memory coverage
 
----
-
-## LangSmith Tracing
-
-Every agent run is fully traced - every node, every LLM call, every tool invocation.
-
-```bash
-# Add to .env:
-LANGCHAIN_API_KEY=ls__your_key_here
-LANGCHAIN_TRACING_V2=true
-LANGCHAIN_PROJECT=incident-response-agent
-```
-
-Get a free key at https://smith.langchain.com
-
----
-
-## Incidents Handled
-
-The agent handles three real-world scenarios out of the box:
-
-**P0 - auth-service outage**
-- Redis pod OOMKilled → all logins fail
-- Agent: restart Redis + auth-service
-
-**P1 - checkout-service high error rate**
-- Missing DB index after deployment → connection pool exhausted
-- Agent: rollback deployment
-
-**P2 - search latency elevated**
-- Elasticsearch shard rebalancing
-- Agent: monitor, self-resolves in 15 min
-
----
-
-## Swapping Mocks for Real Integrations
-
-Each tool in `agent/tools.py` has the real production implementation commented alongside the mock:
-
-```python
-# Production - one env var swap:
-DATADOG_API_KEY=...       # real log queries
-PAGERDUTY_API_KEY=...     # real pages
-SLACK_BOT_TOKEN=...       # real Slack messages
-JIRA_URL + JIRA_TOKEN=... # real tickets
-PROMETHEUS_URL=...        # real metrics
-```
-
----
-
-## Running with Real Ollama
-
-```bash
-# Install and pull model
-brew install ollama
-ollama pull mistral        # recommended
-# or: ollama pull llama3.1
-# or: ollama pull deepseek-coder
-
-# Start Ollama
-ollama serve
-
-# Remove mock flag from .env
-USE_MOCK_LLM=   # leave empty
-
-# Run agent
-python -m agent.listener
-```
-
-
-## What this is NOT
-
-Not a chatbot you ask "what's wrong with my service."
-
-The agent receives an alert, goes and looks at the actual logs and metrics 
-itself, figures out what broke and why, then acts on it - rollback, restart, 
-scale - without being asked. That's the part that felt worth building.
+This repo is best treated as a prototype for building a practical, reviewable AI incident-response assistant with transparent decision-making and a human approval gate.
 
 ---
 
